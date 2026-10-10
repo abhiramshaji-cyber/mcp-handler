@@ -27,10 +27,9 @@ import {
   defineEvent,
   createMcpEvents,
   redisStore,
-  fromUpstash,
   vercelQueue,
 } from "mcp-handler/events";
-import { Redis } from "@upstash/redis";
+import { createClient } from "redis";
 import { send } from "@vercel/queue";
 import { z } from "zod";
 import { canReadProject } from "./permissions";
@@ -64,14 +63,13 @@ that event. Add `match(args, data)` to filter further within a partition.
 ### 2. Create the engine
 
 ```typescript
+const redis = await createClient({ url: process.env.REDIS_URL }).connect();
+
 export const events = createMcpEvents({
   events: [issueCreated],
   // A stable, issuer/tenant-scoped identity from your verified token.
   principal: (authInfo) => `${authInfo.extra?.iss}:${authInfo.extra?.sub}`,
-  store: redisStore({
-    client: fromUpstash(Redis.fromEnv()),
-    prefix: "acme-mcp:",
-  }),
+  store: redisStore({ client: redis, prefix: "acme-mcp:" }),
   queue: vercelQueue({ topic: "mcp-events", send }),
 });
 ```
@@ -135,10 +133,9 @@ export const POST = vercelQueueConsumer(events, handleCallback);
 
 ## Running on Vercel
 
-- **Store.** Add Upstash for Redis from the Vercel Marketplace.
-  `Redis.fromEnv()` reads `UPSTASH_REDIS_REST_URL`/`_TOKEN` or the Marketplace's
-  `KV_REST_API_URL`/`_TOKEN`. Use a distinct `prefix` per logical MCP server
-  when servers share a database.
+- **Store.** Any Redis 6.2 or later, for example a Redis database from the
+  Vercel Marketplace. Pass a connected `redis` (node-redis) client. Use a
+  distinct `prefix` per logical MCP server when servers share a database.
 - **Queue.** Vercel Queues delivers each job to the consumer route registered
   in `vercel.json`. The engine controls retry timing; if you set
   `maxDeliveries` on the trigger, keep it at or above `maxDeliveryAttempts`.
@@ -247,10 +244,11 @@ counters and set indexes, all on opaque strings. The engine builds every
 invariant on top. `runEventsStoreConformance(store)` checks an implementation
 (it resolves or throws, so it works in any test runner).
 
-- `redisStore({ client, prefix })` needs only `eval`; every operation is a
-  single-key Lua script, so it works on Upstash's REST API and on clusters.
-  Use `fromUpstash(redis)` or `fromNodeRedis(client)`, or adapt another client:
-  `{ eval: (script, keys, args) => ioredis.eval(script, keys.length, ...keys, ...args) }`.
+- `redisStore({ client, prefix })` needs only node-redis's
+  `eval(script, { keys, arguments })`. Every operation is a single-key Lua
+  script, so it is atomic and works on clusters. Other clients work through an
+  object with that method, for example
+  `{ eval: (script, { keys, arguments: args }) => ioredis.eval(script, keys.length, ...keys, ...args) }`.
 - `memoryStore()` for development and tests.
 
 **Queues** implement `McpEventsQueue`: an at-least-once `send(job,

@@ -19,7 +19,7 @@ import {
   type McpEventsOptions,
   type McpEventsStore,
 } from "../src/events/index";
-import { fromNodeRedis, redisStore } from "../src/events/engine/redis";
+import { redisStore } from "../src/events/engine/redis";
 import { fakeReceiver } from "./fake-receiver";
 
 vi.mock("node:https", async (importOriginal) => ({
@@ -54,7 +54,7 @@ const stores: [string, () => McpEventsStore][] = [
           "redis",
           () =>
             redisStore({
-              client: fromNodeRedis(redis),
+              client: redis,
               prefix: `test:${crypto.randomUUID()}:`,
             }),
         ],

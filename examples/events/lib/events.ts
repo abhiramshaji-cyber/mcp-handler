@@ -1,13 +1,14 @@
-import { Redis } from "@upstash/redis";
 import { send } from "@vercel/queue";
 import {
   createMcpEvents,
   defineEvent,
-  fromUpstash,
   redisStore,
   vercelQueue,
 } from "mcp-handler/events";
+import { createClient } from "redis";
 import { z } from "zod";
+
+const redis = await createClient({ url: process.env.REDIS_URL }).connect();
 
 // TODO: Replace with your application's permission check.
 async function canReadProject(principal: string, projectId: string) {
@@ -39,10 +40,6 @@ export const events = createMcpEvents({
   // Scope identities by issuer so users from different tenants never collide.
   principal: (authInfo) =>
     `${String(authInfo.extra?.issuer)}:${String(authInfo.extra?.userId)}`,
-  // Upstash for Redis from the Vercel Marketplace (KV_REST_API_* variables).
-  store: redisStore({
-    client: fromUpstash(Redis.fromEnv()),
-    prefix: "issues-mcp:",
-  }),
+  store: redisStore({ client: redis, prefix: "issues-mcp:" }),
   queue: vercelQueue({ topic: "mcp-events", send }),
 });
