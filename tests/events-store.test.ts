@@ -2,6 +2,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { memoryStore } from "../src/events/engine/store";
 import { memoryQueue, type McpEventsJob } from "../src/events/engine/queue";
 import { runEventsStoreConformance } from "../src/events/engine/conformance";
+import { fromNodeRedis, redisStore } from "../src/events/engine/redis";
+import { createClient } from "redis";
 
 const job = (eventId: string): McpEventsJob => ({
   type: "deliver",
@@ -29,6 +31,45 @@ describe("memoryStore", () => {
     await expect(runEventsStoreConformance(broken)).rejects.toThrow(
       "put with version null fails when the key exists",
     );
+  });
+});
+
+describe.skipIf(!process.env.REDIS_URL)("redisStore", () => {
+  it("passes the store conformance checks against a real Redis", async () => {
+    const client = createClient({ url: process.env.REDIS_URL });
+    await client.connect();
+    try {
+      const store = redisStore({ client: fromNodeRedis(client) });
+      await expect(runEventsStoreConformance(store)).resolves.toBe(undefined);
+    } finally {
+      await client.quit();
+    }
+  });
+
+  it("survives clients that JSON-parse replies", async () => {
+    const client = createClient({ url: process.env.REDIS_URL });
+    await client.connect();
+    try {
+      // Mimic Upstash's automatic deserialization of every string in a reply.
+      const parse = (value: unknown): unknown => {
+        if (Array.isArray(value)) return value.map(parse);
+        if (typeof value !== "string") return value;
+        try {
+          return JSON.parse(value);
+        } catch {
+          return value;
+        }
+      };
+      const store = redisStore({
+        client: {
+          eval: async (script, keys, args) =>
+            parse(await client.eval(script, { keys, arguments: args })),
+        },
+      });
+      await expect(runEventsStoreConformance(store)).resolves.toBe(undefined);
+    } finally {
+      await client.quit();
+    }
   });
 });
 

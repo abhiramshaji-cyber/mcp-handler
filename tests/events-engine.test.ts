@@ -1,4 +1,14 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+} from "vitest";
+import { createClient } from "redis";
 import { z } from "zod";
 import { createMcpHandler, withMcpAuth } from "../src/index";
 import {
@@ -7,7 +17,9 @@ import {
   memoryQueue,
   memoryStore,
   type McpEventsOptions,
+  type McpEventsStore,
 } from "../src/events/index";
+import { fromNodeRedis, redisStore } from "../src/events/engine/redis";
 import { fakeReceiver } from "./fake-receiver";
 
 vi.mock("node:https", async (importOriginal) => ({
@@ -24,10 +36,37 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
+// Every engine test runs against memory, and against Redis when REDIS_URL is set.
+const redis = process.env.REDIS_URL
+  ? createClient({ url: process.env.REDIS_URL })
+  : undefined;
+beforeAll(async () => {
+  await redis?.connect();
+});
+afterAll(async () => {
+  await redis?.quit();
+});
+const stores: [string, () => McpEventsStore][] = [
+  ["memory", () => memoryStore()],
+  ...(redis
+    ? ([
+        [
+          "redis",
+          () =>
+            redisStore({
+              client: fromNodeRedis(redis),
+              prefix: `test:${crypto.randomUUID()}:`,
+            }),
+        ],
+      ] as [string, () => McpEventsStore][])
+    : []),
+];
+let makeStore = stores[0][1];
+
 function setup(
   overrides: Partial<McpEventsOptions> = {},
   input: z.ZodType = z.strictObject({ project: z.string() }),
-  store = memoryStore(),
+  store = makeStore(),
 ) {
   const queue = memoryQueue({ mode: "manual" });
   const allowed = new Set(["alice:ABC", "alice:XYZ", "bob:ABC"]);
@@ -151,7 +190,11 @@ function setup(
   };
 }
 
-describe("createMcpEvents", () => {
+describe.each(stores)("createMcpEvents (%s store)", (_, factory) => {
+  beforeEach(() => {
+    makeStore = factory;
+  });
+
   it("verifies once per principal and URL, then delivers signed events to its partition", async () => {
     const receiver = fakeReceiver();
     const app = setup();
@@ -293,7 +336,7 @@ describe("createMcpEvents", () => {
 
   it("terminates subscriptions whose stored arguments no longer fit the schema", async () => {
     const receiver = fakeReceiver();
-    const store = memoryStore();
+    const store = makeStore();
     await setup({}, undefined, store).subscribe("alice", "ABC", { sep: true });
     // A later deployment changes the input schema incompatibly.
     const next = setup(

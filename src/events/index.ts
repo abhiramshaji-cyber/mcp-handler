@@ -11,6 +11,8 @@ export type {
 } from "./engine/engine";
 export { memoryStore } from "./engine/store";
 export type { McpEventsStore } from "./engine/store";
+export { fromNodeRedis, fromUpstash, redisStore } from "./engine/redis";
+export type { RedisLike } from "./engine/redis";
 export { memoryQueue } from "./engine/queue";
 export type {
   McpEventsJob,
