@@ -1,58 +1,330 @@
-# Experimental MCP Events
+# MCP Events (experimental)
 
-`experimental_registerMcpEvents` adds the webhook control methods from the
-[MCP Events design sketch](https://github.com/modelcontextprotocol/experimental-ext-triggers-events/blob/28ec35e905daa241f019981e2836b4a02f1c0368/docs/design-sketch-proposal.md)
-to an existing MCP handler. The proposal is experimental; this API may change
-alongside it.
+MCP Events lets an MCP client subscribe to things that happen in your system,
+such as a new issue or a failed build, and have its agent react without the user
+being present. `mcp-handler/events` implements the server side with **webhook
+delivery**: the client subscribes on your existing MCP route, and your server
+POSTs signed events to the client's callback URL.
+
+It follows draft [SEP-3415](https://github.com/modelcontextprotocol/modelcontextprotocol/pull/3415)
+and also speaks the earlier design-sketch dialect that
+[ChatGPT implements](https://developers.openai.com/plugins/build/mcp-events),
+detected per request (see [Protocol compatibility](#protocol-compatibility)).
+Both the draft and this API are experimental and may change. Poll and push
+delivery are not implemented; no client we target uses them.
+
+You provide event definitions, a durable store and a queue. The engine handles
+subscription storage, callback verification, fan-out, signing, retries, secret
+rotation, expiry and revocation.
+
+## Quickstart
+
+### 1. Define events
 
 ```typescript
+// lib/events.ts
 import {
-  createMcpHandler,
-  experimental_registerMcpEvents,
-  withMcpAuth,
-  type ExperimentalMcpEventDefinition,
-} from "mcp-handler";
+  defineEvent,
+  createMcpEvents,
+  redisStore,
+  fromUpstash,
+  vercelQueue,
+} from "mcp-handler/events";
+import { Redis } from "@upstash/redis";
+import { send } from "@vercel/queue";
 import { z } from "zod";
-import {
-  subscriptionStore,
-  durableWebhookDelivery,
-  principalFromVerifiedAuth,
-  canReadAnyProject,
-  canReadProject,
-  verifyToken,
-} from "./events-backend";
+import { canReadProject } from "./permissions";
 
-const issueCreated: ExperimentalMcpEventDefinition = {
+export const issueCreated = defineEvent({
   name: "issue.created",
   description: "A new issue is created in a project.",
-  inputSchema: z.strictObject({ project_id: z.string() }),
-  payloadSchema: z.object({ id: z.string(), title: z.string() }),
-  authorizeDiscovery: ({ principal }) => canReadAnyProject(principal),
-  authorize: (args, { principal }) =>
-    canReadProject(principal, args.project_id as string),
-};
-
-const handler = createMcpHandler((server) => {
-  experimental_registerMcpEvents(server, {
-    events: [issueCreated],
-    getPrincipal: principalFromVerifiedAuth,
-    subscriptions: subscriptionStore,
-    delivery: durableWebhookDelivery,
-  });
+  input: z.strictObject({ projectId: z.string() }),
+  payload: z.object({
+    id: z.string(),
+    title: z.string(),
+    projectId: z.string(),
+  }),
+  // Runs at subscribe time and again before every delivery.
+  authorize: ({ projectId }, { principal }) =>
+    canReadProject(principal, projectId),
+  // Route each event only to subscriptions for the same project.
+  partitionBy: {
+    arguments: ({ projectId }) => projectId,
+    payload: (issue) => issue.projectId,
+  },
 });
-
-export const POST = withMcpAuth(handler, verifyToken, { required: true });
 ```
 
-`./events-backend` is application code, not an included adapter. It supplies
-verified identity, authorization, durable subscription storage and delivery
-infrastructure. Registration does not create a database or start background
-timers. Optional [webhook helpers](#optional-webhook-helpers) implement callback
-verification and individual delivery attempts for Node.js backends.
+`input` describes the subscription arguments (filters) and `payload` the
+delivered `data`. Use schemas that don't transform values: defaults, coercion
+or stripping are rejected because arguments are part of subscription identity.
+`partitionBy` is optional; without it every emit checks every subscription to
+that event. Add `match(args, data)` to filter further within a partition.
 
-## Methods and capabilities
+### 2. Create the engine
 
-The existing MCP endpoint advertises `capabilities.events: {}` and serves:
+```typescript
+export const events = createMcpEvents({
+  events: [issueCreated],
+  // A stable, issuer/tenant-scoped identity from your verified token.
+  principal: (authInfo) => `${authInfo.extra?.iss}:${authInfo.extra?.sub}`,
+  store: redisStore({
+    client: fromUpstash(Redis.fromEnv()),
+    prefix: "acme-mcp:",
+  }),
+  queue: vercelQueue({ topic: "mcp-events", send }),
+});
+```
+
+### 3. Serve it from your MCP route
+
+```typescript
+// app/mcp/route.ts
+import { createMcpHandler, withMcpAuth } from "mcp-handler";
+import { events } from "@/lib/events";
+
+const handler = createMcpHandler(registerTools, { events });
+
+export const POST = withMcpAuth(handler, verifyToken, {
+  required: true,
+  resourceUrl: "https://mcp.example.com",
+});
+```
+
+The `events` option adds `events/list`, `events/subscribe` and
+`events/unsubscribe` to the same route as your tools. Events require an
+authenticated principal; there is no anonymous mode.
+
+### 4. Emit events
+
+Call `emit` wherever changes arrive, for example an upstream webhook route:
+
+```typescript
+await events.emit(issueCreated, issue, {
+  id: delivery.id, // stable for this occurrence; duplicates collapse
+  occurredAt: new Date(issue.createdAt),
+});
+```
+
+`emit` validates the data against the payload schema and queues one fan-out
+job. It does not wait for deliveries.
+
+### 5. Deliver from a queue consumer
+
+```typescript
+// app/api/mcp-events/route.ts
+import { handleCallback } from "@vercel/queue";
+import { vercelQueueConsumer } from "mcp-handler/events";
+import { events } from "@/lib/events";
+
+export const POST = vercelQueueConsumer(events, handleCallback);
+```
+
+```json
+// vercel.json
+{
+  "functions": {
+    "app/api/mcp-events/route.ts": {
+      "experimentalTriggers": [
+        { "type": "queue/v2beta", "topic": "mcp-events" }
+      ]
+    }
+  }
+}
+```
+
+## Running on Vercel
+
+- **Store.** Add Upstash for Redis from the Vercel Marketplace.
+  `Redis.fromEnv()` reads `UPSTASH_REDIS_REST_URL`/`_TOKEN` or the Marketplace's
+  `KV_REST_API_URL`/`_TOKEN`. Use a distinct `prefix` per logical MCP server
+  when servers share a database.
+- **Queue.** Vercel Queues delivers each job to the consumer route registered
+  in `vercel.json`. The engine controls retry timing; if you set
+  `maxDeliveries` on the trigger, keep it at or above `maxDeliveryAttempts`.
+  Give the consumer a `maxDuration` above the webhook timeout (10 seconds by
+  default). Messages are pinned to the deployment that published them, so
+  retries after a deploy run the old code until they finish.
+- **Runtime.** `mcp-handler/events` uses Node.js built-ins; run the MCP route
+  and the consumer on the Node.js runtime. The root `mcp-handler` entry stays
+  free of them.
+- **Auth.** Use OAuth with `withMcpAuth(..., { required: true })` and set
+  `resourceUrl` to your stable public origin, never a per-deployment URL.
+  ChatGPT requests only the OAuth scopes your tools declare, so make sure the
+  scopes `events/*` requires are among them.
+- **Deployment Protection and Firewall.** Clients must reach `/mcp` without
+  Vercel authentication: use a production domain (Standard Protection leaves
+  it public) or a Deployment Protection Exception. Bot Protection challenges
+  and the AI Bots ruleset can block MCP clients; start them in Log mode.
+
+For local development, `memoryStore()` and `memoryQueue()` keep everything in
+one process (`memoryQueue({ mode: "manual" })` waits for `drain()`, which suits
+tests). Neither survives a restart or works across serverless instances.
+
+## Protocol compatibility
+
+|                      | SEP-3415 clients                                                                                                                      | ChatGPT compat                                           |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------- |
+| Detected by          | The request declares `extensions["io.modelcontextprotocol/events"]` in its per-request client capabilities                            | Everything else, including all pre-`2026-07-28` requests |
+| Capability           | `capabilities.extensions["io.modelcontextprotocol/events"]`                                                                           | top-level `capabilities.events`                          |
+| Error codes          | NotFound `-32023`, Forbidden `-32024`, ResourceExhausted `-32025`, Unsupported `-32026`, CallbackEndpointError `-32027` (provisional) | `-32011` … `-32015` in the same order                    |
+| `terminated` notices | Sent on revocation and incompatible schema changes                                                                                    | Not sent (unsupported by ChatGPT)                        |
+
+The server always advertises both capability shapes. Each subscription
+remembers the dialect of the client that created or last refreshed it, so
+background deliveries know whether `terminated` notices are allowed. Webhook
+payloads, headers and signatures are identical in both. Set
+`chatgptCompat: false` to serve SEP-3415 only.
+
+## How subscriptions and delivery work
+
+**Subscribe.** The engine authenticates the caller, validates and authorizes
+the arguments, reserves the subscription, verifies the callback, then commits
+the grant. Verification sends a signed challenge the endpoint must echo. A
+successful challenge is cached per (principal, URL) for `consentTtlMs`, so
+refreshes and new filters for the same callback skip it. Verification attempts
+are limited per principal and host and per host overall, and each principal
+has at most `subscriptionsPerPrincipal` subscriptions. If an unsubscribe
+arrives while a challenge is outstanding, the late result cannot activate the
+subscription.
+
+**Lifetime.** Grants last `ttl.defaultMs` (1 hour) unless the client asks for
+less, clamped to `ttl.minMs` and `ttl.maxMs`. Clients refresh by subscribing
+again before `refreshBefore`; a refresh with a new secret keeps signing with
+the old one too for `secretRotationGraceMs`. ChatGPT sends no `ttlMs`, so the
+default sets its refresh cadence, and removing a plugin sends no unsubscribe:
+expiry cleans up.
+
+**Emit and fan-out.** `emit` queues one fan-out job, which pages through the
+subscriptions in the event's partition, applies `match`, and queues one
+delivery per subscription. Repeated emits with the same `id` and repeated
+fan-out runs produce one delivery per subscription.
+
+**Delivery.** Each delivery reloads the subscription, re-runs `authorize` and
+checks expiry, then POSTs `{ eventId, name, timestamp, data, cursor }` with
+Standard Webhooks headers and `X-MCP-Subscription-Id`. A `2xx` status
+acknowledges it. Other failures are retried up to `maxDeliveryAttempts` (5)
+using the endpoint's `Retry-After` or 30 s, 1 min, 3 min and 8 min. `410`,
+`413`, redirects and blocked destinations are not retried. Results feed the
+`deliveryStatus` returned on the next refresh.
+
+**Revocation.** When `authorize` stops returning `true`, the subscription is
+removed. SEP-3415 clients receive a `terminated` notice; ChatGPT learns on its
+next refresh, which returns Forbidden. A policy service outage is not treated
+as revocation: the delivery is retried. If a deployment changes an event's
+input schema so stored arguments no longer validate, those subscriptions end
+the same way with `Unsupported`.
+
+**No replay.** Deliveries carry `cursor: null`, so clients resubscribe from
+"now". A subscribe that asks to resume from a cursor gets `truncated: true`.
+
+Callbacks must be HTTPS to a public address checked at connection time;
+redirects are never followed. See [Network options](#network-options) to
+allow private receivers.
+
+## Configuration
+
+| Option                       | Default             | Meaning                                                                |
+| ---------------------------- | ------------------- | ---------------------------------------------------------------------- |
+| `events`                     | required            | Definitions from `defineEvent`, with unique names                      |
+| `principal(authInfo)`        | required            | Stable identity from verified auth. Never the OAuth client ID          |
+| `store`, `queue`             | required            | See [Storage and queues](#storage-and-queues)                          |
+| `ttl`                        | 1 min / 1 h / 1 day | `{ minMs, defaultMs, maxMs, allowNoExpiry }`                           |
+| `chatgptCompat`              | `true`              | Serve the ChatGPT dialect to clients that don't declare SEP-3415       |
+| `network`                    | —                   | `{ allowIPAddressList, timeoutMs }` for verification and delivery      |
+| `maxDeliveryAttempts`        | `5`                 | Attempts per event and subscription                                    |
+| `subscriptionsPerPrincipal`  | `100`               | Active and pending subscriptions per principal                         |
+| `verificationsPerMinute`     | `10`                | Challenges per principal and callback host                             |
+| `hostVerificationsPerMinute` | `600`               | Challenges per callback host across principals (ChatGPT uses one host) |
+| `consentTtlMs`               | 1 day               | How long a verified (principal, URL) skips the challenge               |
+| `secretRotationGraceMs`      | 10 min              | How long deliveries stay signed with a replaced secret                 |
+| `onError(error, job)`        | —                   | Unexpected errors while processing jobs                                |
+
+## Storage and queues
+
+**Stores** implement `McpEventsStore`: per-key compare-and-set, expiry,
+counters and set indexes, all on opaque strings. The engine builds every
+invariant on top. `runEventsStoreConformance(store)` checks an implementation
+(it resolves or throws, so it works in any test runner).
+
+- `redisStore({ client, prefix })` needs only `eval`; every operation is a
+  single-key Lua script, so it works on Upstash's REST API and on clusters.
+  Use `fromUpstash(redis)` or `fromNodeRedis(client)`, or adapt another client:
+  `{ eval: (script, keys, args) => ioredis.eval(script, keys.length, ...keys, ...args) }`.
+- `memoryStore()` for development and tests.
+
+**Queues** implement `McpEventsQueue`: an at-least-once `send(job,
+{ idempotencyKey, delayMs })`. Their consumer passes each job to
+`events.process(job, { attempt })` and retries after `retryAfterMs` when the
+result has one. `vercelQueue` / `vercelQueueConsumer` do this for Vercel
+Queues; `memoryQueue()` does it in-process.
+
+## Testing with ChatGPT
+
+ChatGPT supports MCP Events in Work chats on chatgpt.com, desktop Work chats
+with Cloud selected, and dots
+([OpenAI docs](https://developers.openai.com/plugins/build/mcp-events)). Field
+reports so far succeed fastest with a personal Plus or Pro account and a
+personal plugin in a Work chat on the web; managed workspaces need admin
+permissions for custom MCP servers and event-triggered tasks.
+
+1. Deploy to a public production domain and confirm an unauthenticated request
+   to `/mcp` returns your app's `401` with `WWW-Authenticate`, not a Vercel
+   login page.
+2. In ChatGPT, add a custom MCP server (chatgpt.com/plugins), choose **OAuth**
+   (not "OAuth or no authentication", since events require a principal), and
+   install the plugin.
+3. Check your logs for `server/discover` and `events/list`; the events appear
+   next to the tools on the plugin page. Refresh the plugin after every server
+   change.
+4. In a Work chat, ask ChatGPT to watch something. Expect `events/subscribe`
+   with a `whsec_` secret and a callback on `connectors.api.openai.com`, then a
+   verification POST that ChatGPT answers with the echoed challenge.
+5. Emit a matching event and confirm a `2xx` delivery and a reply in the chat.
+   Emit a non-matching one and confirm nothing is sent.
+6. Stop monitoring (delete the task under Scheduled) and confirm
+   `events/unsubscribe`. Then test refresh across a redeploy, revoked access,
+   duplicate events and bursts (ChatGPT may batch them).
+
+Before involving ChatGPT, point a subscription at a receiver you control that
+echoes challenges and checks signatures with a Standard Webhooks library. For a
+receiver on a private address, allow it with `network.allowIPAddressList` (in
+test configuration only) and serve a certificate Node.js trusts.
+
+## Advanced: bring your own infrastructure
+
+`createMcpEvents` is built from lower-level pieces exported by
+`mcp-handler/events/advanced`, for applications with their own storage,
+queueing or delivery. With them you implement the subscription and delivery
+adapters described below yourself:
+
+```typescript
+import { createMcpHandler } from "mcp-handler";
+import { registerMcpEvents } from "mcp-handler/events/advanced";
+import {
+  issueCreated,
+  subscriptionStore,
+  webhookDelivery,
+} from "./events-backend";
+
+const handler = createMcpHandler((server) => {
+  registerMcpEvents(server, {
+    events: [issueCreated],
+    getPrincipal: (authInfo) => principalFromVerifiedAuth(authInfo),
+    subscriptions: subscriptionStore,
+    delivery: webhookDelivery,
+  });
+});
+```
+
+The root `mcp-handler` entry keeps the 2.3.0 exports
+(`experimental_registerMcpEvents`, `experimental_validateMcpEventDelivery` and
+their `Experimental*` types) and has no Node.js-only dependencies.
+
+### Methods and capabilities
+
+The existing MCP endpoint advertises both capability shapes (see
+[Protocol compatibility](#protocol-compatibility)) and serves:
 
 | Method               | Behavior                                                                                                                                                                                           |
 | -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -66,11 +338,10 @@ outbound operation to the client's callback. Poll and push are not advertised
 or implemented. The helper does not add anything to `tools/list`; a client that
 wants model-callable subscription tools must build those from `events/list`.
 
-The current `@modelcontextprotocol/client` 2.0 capability parser drops the draft
-`events` field from `getServerCapabilities()`, even though it is present in the
-server's `server/discover` response. An Events-aware client must preserve the
-extension in discovery or call `events/list` explicitly. The generic SDK's
-capability accessor alone cannot determine whether this extension is available.
+The `@modelcontextprotocol/client` 2.0 capability parser drops the top-level
+`events` field from `getServerCapabilities()` but keeps
+`extensions["io.modelcontextprotocol/events"]`, so SDK-based clients can detect
+the extension from the SEP-3415 shape.
 
 The catalog is returned as a single page, without `nextCursor`. Requests with a
 catalog cursor are rejected. For account-specific discovery, supply a resolver:
@@ -107,7 +378,7 @@ still receive request `authInfo`. Use non-transforming Standard Schemas:
 defaults, stripping fields, coercion or other argument transformations are
 rejected when they change the input, because arguments are part of identity.
 
-## Principal and subscription identity
+### Principal and subscription identity
 
 `getPrincipal` receives the verified `AuthInfo` provided by `withMcpAuth`. Return
 a stable, tenant/issuer-scoped user or app identifier. For example, derive it from
@@ -134,18 +405,19 @@ per logical MCP server so unrelated servers cannot mix their subscriptions.
 Unsubscribe accepts `name`, `arguments` and `delivery.url`, not a subscription
 ID. It remains available when an event disappears or its schema changes: cleanup
 uses the saved identity, not the current catalog. A missing subscription returns
-the draft's `-32011` error with `data.kind: "subscription"`.
+NotFound (`-32023`, or `-32011` in ChatGPT compat) with
+`data.kind: "subscription"`.
 
-## Adapter contracts
+### Adapter contracts
 
 The exported types describe the required methods:
 
-| Adapter                            | Method                                       | Required behavior                                                                                                                                                                                                                   |
-| ---------------------------------- | -------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `ExperimentalMcpWebhookDelivery`   | `verifyEndpoint(target, context)`            | Prove callback consent before activation. Return `{ verified: true }` only after a signed challenge succeeds or another verification mechanism allowed by the draft establishes consent; otherwise return a categorized failure.    |
-| `ExperimentalMcpSubscriptionStore` | `prepare(key, context)`                      | Reserve a bounded, durable operation and return its unique fencing token. Apply admission limits before verification. Preserve any current active grant.                                                                            |
-| `ExperimentalMcpSubscriptionStore` | `upsert(subscription, context, operationId)` | Atomically require the current, unexpired operation token before persisting/refreshing the verified subscription and arranging activation/reconciliation. Return `{ cursor, truncated, deliveryStatus? }` from the delivery system. |
-| `ExperimentalMcpSubscriptionStore` | `remove(key, context)`                       | Atomically invalidate pending operations, stop delivery and arrange cleanup. Return true for a grant or pending reservation; false if neither exists.                                                                               |
+| Adapter                | Method                                       | Required behavior                                                                                                                                                                                                                   |
+| ---------------------- | -------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `McpWebhookDelivery`   | `verifyEndpoint(target, context)`            | Prove callback consent before activation. Return `{ verified: true }` only after a signed challenge succeeds or another verification mechanism allowed by the draft establishes consent; otherwise return a categorized failure.    |
+| `McpSubscriptionStore` | `prepare(key, context)`                      | Reserve a bounded, durable operation and return its unique fencing token. Apply admission limits before verification. Preserve any current active grant.                                                                            |
+| `McpSubscriptionStore` | `upsert(subscription, context, operationId)` | Atomically require the current, unexpired operation token before persisting/refreshing the verified subscription and arranging activation/reconciliation. Return `{ cursor, truncated, deliveryStatus? }` from the delivery system. |
+| `McpSubscriptionStore` | `remove(key, context)`                       | Atomically invalidate pending operations, stop delivery and arrange cleanup. Return true for a grant or pending reservation; false if neither exists.                                                                               |
 
 These can be two interfaces to the same durable backend. The store is a lifecycle
 adapter, not just a raw key/value database client: `upsert` must not commit a row
@@ -189,7 +461,7 @@ Only consent established by the verifier is passed into `upsert`. A `prepare`
 reservation does not activate delivery or change a current grant's secret or
 expiry. It may record pending operation metadata before verification.
 
-### Coordinating verification with cancellation
+#### Coordinating verification with cancellation
 
 The call order is `prepare → verifyEndpoint → upsert`. The helper passes the
 opaque token returned by `prepare` as `upsert`'s third argument. The token stays
@@ -224,7 +496,7 @@ operation tokens or endpoint responses.
 The tests demonstrate this ordering with an in-memory adapter fixture. Real
 adapters need database-backed fencing and their own concurrency/recovery tests.
 
-### Migrating an existing server
+#### Migrating an existing server
 
 Preserve the server-selected principal and callback URL representation used by
 existing subscriptions. This helper hashes the supplied URL verbatim; a backend
@@ -233,7 +505,7 @@ Keep no-expiry behavior explicit with `ttl.allowNoExpiry`, and reject unsupporte
 replay cursors in the backend instead of returning a false success. Applications
 without replay should continue returning `cursor: null`.
 
-## Optional webhook helpers
+### Optional webhook helpers
 
 Three experimental Node.js helpers cover the signed challenge exchange, a single
 event delivery attempt, and `gap`/`terminated` notices. They use
@@ -243,18 +515,18 @@ fragments, reject private/special-use addresses unless explicitly allowed,
 preserve TLS certificate verification, and never follow redirects. These
 restrictions also apply in development. There is no custom `fetch` or agent
 override; applications with a different egress policy (for example, a mandatory
-outbound proxy) can keep their own `ExperimentalMcpWebhookDelivery`
+outbound proxy) can keep their own `McpWebhookDelivery`
 implementation.
 
-### Network options
+#### Network options
 
 Every helper accepts the same optional settings: the third argument of
-`experimental_verifyMcpWebhookEndpoint`, or `network` for the other two.
+`verifyWebhookEndpoint`, or `network` for the other two.
 
 ```typescript
-import type { ExperimentalMcpWebhookNetworkOptions } from "mcp-handler";
+import type { WebhookNetworkOptions } from "mcp-handler/events/advanced";
 
-export const webhookNetwork: ExperimentalMcpWebhookNetworkOptions = {
+export const webhookNetwork: WebhookNetworkOptions = {
   // Private receivers you operate. Every other non-public address stays blocked.
   allowIPAddressList: ["10.20.0.0/16"],
   timeoutMs: 5_000,
@@ -271,9 +543,9 @@ client input. To test end to end against a local receiver, allow `127.0.0.1` in
 test configuration only and serve HTTPS with a certificate Node.js trusts, for
 example through `NODE_EXTRA_CA_CERTS`.
 
-### Verify callback consent
+#### Verify callback consent
 
-`experimental_verifyMcpWebhookEndpoint(target, context, network?)` can be used
+`verifyWebhookEndpoint(target, context, network?)` can be used
 directly as `verifyEndpoint`. It sends one signed verification challenge and
 returns `{ verified: true }` only when a complete `2xx` JSON response echoes the
 nonce. Mismatches and transport failures return `{ verified: false, reason }`
@@ -285,16 +557,16 @@ Wrap it in your application's consent cache and admission controls:
 
 ```typescript
 import {
-  experimental_verifyMcpWebhookEndpoint,
-  type ExperimentalMcpWebhookDelivery,
-} from "mcp-handler";
+  verifyWebhookEndpoint,
+  type McpWebhookDelivery,
+} from "mcp-handler/events/advanced";
 import {
   consentStore,
   verificationLimiter,
   webhookNetwork,
 } from "./events-backend";
 
-export const webhookDelivery: ExperimentalMcpWebhookDelivery = {
+export const webhookDelivery: McpWebhookDelivery = {
   async verifyEndpoint(target, context) {
     // Scope this store to this logical MCP server; isVerified checks expiry.
     const key = { principal: context.principal, url: target.url };
@@ -302,11 +574,7 @@ export const webhookDelivery: ExperimentalMcpWebhookDelivery = {
 
     // Bound attempts per destination host, including failed challenges.
     await verificationLimiter.check(new URL(target.url).hostname);
-    const result = await experimental_verifyMcpWebhookEndpoint(
-      target,
-      context,
-      webhookNetwork
-    );
+    const result = await verifyWebhookEndpoint(target, context, webhookNetwork);
     if (result.verified) await consentStore.markVerified(key);
     return result;
   },
@@ -321,17 +589,17 @@ with durable no-expiry subscriptions. Keep the existing `prepare → verifyEndpo
 → upsert` ordering; a successful challenge alone does not activate delivery or
 make a stale reservation valid.
 
-### Send one event
+#### Send one event
 
-`experimental_deliverMcpEvent` invokes `experimental_validateMcpEventDelivery`
+`deliverWebhookEvent` invokes `validateEventDelivery`
 first, then signs and sends the event. Use it from a durable worker after loading
 current active state and matching the source event to the subscription filters:
 
 ```typescript
 import {
-  experimental_deliverMcpEvent,
-  experimental_sendMcpWebhookControl,
-} from "mcp-handler";
+  deliverWebhookEvent,
+  sendWebhookControl,
+} from "mcp-handler/events/advanced";
 import {
   issueCreated,
   subscriptionStore,
@@ -343,7 +611,7 @@ async function attemptDelivery(job) {
   if (!subscription) return { done: true };
 
   // The worker owns filter matching and coordination with cancellation.
-  const result = await experimental_deliverMcpEvent({
+  const result = await deliverWebhookEvent({
     event: issueCreated,
     subscription,
     payload: job.payload,
@@ -351,7 +619,7 @@ async function attemptDelivery(job) {
     timestamp: new Date(job.occurredAt),
     cursor: job.safeWatermark,
     previousSecrets: await subscriptionStore.getPreviousSecrets(
-      subscription.id
+      subscription.id,
     ),
     network: webhookNetwork,
     signal: job.signal,
@@ -360,11 +628,11 @@ async function attemptDelivery(job) {
 
   if (result.reason === "forbidden") {
     // Access was revoked: notify the receiver, then remove the subscription.
-    await experimental_sendMcpWebhookControl({
+    await sendWebhookControl({
       subscription,
       control: {
         type: "terminated",
-        error: { code: -32012, message: "Forbidden" },
+        error: { code: -32024, message: "Forbidden" },
       },
       network: webhookNetwork,
     });
@@ -425,14 +693,14 @@ not revoked access; and caller cancellation. The helper does not schedule
 retries, update acknowledgement state, compute watermarks, cache permissions, or
 delete subscriptions.
 
-### Send gap and termination notices
+#### Send gap and termination notices
 
-`experimental_sendMcpWebhookControl({ subscription, control, previousSecrets?,
+`sendWebhookControl({ subscription, control, previousSecrets?,
 network?, signal? })` signs and sends one of the draft's non-event bodies, with
 the same headers and transport rules as events:
 
 ```typescript
-await experimental_sendMcpWebhookControl({
+await sendWebhookControl({
   subscription,
   control: { type: "gap", cursor: freshCursor },
   network: webhookNetwork,
@@ -461,14 +729,14 @@ aborts, truncated responses and oversized challenge responses tear down the
 request. The validation-only helper below remains useful when your backend
 already provides signing and delivery.
 
-## Validating delivery in a worker
+### Validating delivery in a worker
 
 Export the same event definition for your MCP handler and durable worker. Before
 each delivery attempt, load the current active subscription and validate the
 candidate data:
 
 ```typescript
-import { experimental_validateMcpEventDelivery } from "mcp-handler";
+import { validateEventDelivery } from "mcp-handler/events/advanced";
 import {
   issueCreated,
   subscriptionStore,
@@ -480,7 +748,7 @@ async function deliverIssue(subscriptionId: string, payload: unknown) {
   const subscription = await subscriptionStore.get(subscriptionId);
   if (!subscription) return;
 
-  await experimental_validateMcpEventDelivery({
+  await validateEventDelivery({
     event: issueCreated,
     subscription,
     payload,
@@ -510,7 +778,7 @@ expiry are separate; a user does not need to stay logged in. The draft recommend
 periodic permission rechecks; it does not mandate token verification for every
 event. This helper invokes the policy on each call and does not cache its result.
 
-Known failures throw `ExperimentalMcpEventDeliveryError` with a fixed message and
+Known failures throw `EventDeliveryError` with a fixed message and
 one of these `code` values:
 
 | Code                   | Meaning                                                                  |
@@ -526,7 +794,7 @@ Do not send on any failure. Policy/schema exceptions and abort reasons propagate
 unchanged: a permissions-service outage is not proof of revocation. Let the
 durable worker decide retries and termination; this helper does not delete
 subscriptions or send signed termination controls (see
-[`experimental_sendMcpWebhookControl`](#send-gap-and-termination-notices)).
+[`sendWebhookControl`](#send-gap-and-termination-notices)).
 
 This validates a candidate against the supplied state, not against the database.
 It cannot detect a cancelled or suspended subscription in an old snapshot.
@@ -538,7 +806,7 @@ records trusted, and do not mutate validated values before sending. The helper
 does not sign or verify webhook signatures, make network requests, or schedule
 work.
 
-## TTL and refresh
+### TTL and refresh
 
 By default, the server grants one hour, clamps requests to a one-minute minimum
 and one-day maximum, and does not grant no-expiry subscriptions. Configure this
@@ -556,7 +824,7 @@ reactivates suspended delivery, and returns its latest cursor/status. No-expiry
 clients should still occasionally refresh for health checks and cursor progress.
 Webhook mode does not need push heartbeat notifications or a held-open connection.
 
-## Request telemetry
+### Request telemetry
 
 `onEvent` continues to report requests, but telemetry for every `events/*`
 method replaces a supplied `params.delivery.secret` with `[REDACTED]`, including
