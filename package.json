@@ -34,23 +34,12 @@
       },
       "import": "./dist/events/index.mjs",
       "require": "./dist/events/index.js"
-    },
-    "./events/advanced": {
-      "types": {
-        "import": "./dist/events/advanced.d.mts",
-        "require": "./dist/events/advanced.d.ts"
-      },
-      "import": "./dist/events/advanced.mjs",
-      "require": "./dist/events/advanced.js"
     }
   },
   "typesVersions": {
     "*": {
       "events": [
         "./dist/events/index.d.ts"
-      ],
-      "events/advanced": [
-        "./dist/events/advanced.d.ts"
       ]
     }
   },

@@ -5,7 +5,6 @@ export default defineConfig({
     'src/index.ts',
     'src/cli/index.ts',
     'src/events/index.ts',
-    'src/events/advanced.ts',
   ],
   format: ['esm', 'cjs'],
   dts: true,

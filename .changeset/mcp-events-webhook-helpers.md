@@ -6,4 +6,4 @@ Add an experimental MCP Events engine at `mcp-handler/events`. `defineEvent` and
 
 Events now follow draft SEP-3415 while staying compatible with ChatGPT: both capability shapes are advertised, and error codes and `terminated` notices follow the dialect each client declares per request (`chatgptCompat: false` serves SEP-3415 only).
 
-Low-level verification, delivery and control helpers are available from `mcp-handler/events/advanced`. The root entry keeps its 2.3.0 exports without Node.js-only dependencies, and its CommonJS type declarations now resolve.
+The root entry keeps its 2.3.0 exports without Node.js-only dependencies, and its CommonJS type declarations now resolve.

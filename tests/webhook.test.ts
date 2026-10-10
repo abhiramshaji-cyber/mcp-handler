@@ -8,11 +8,13 @@ import {
   deliverWebhookEvent,
   sendWebhookControl,
   verifyWebhookEndpoint,
-  type McpEventContext,
-  type McpWebhookSubscription,
   type WebhookControl,
   type WebhookEventDeliveryOptions,
-} from "../src/events/advanced";
+} from "../src/events/webhook";
+import type {
+  ExperimentalMcpEventContext as McpEventContext,
+  ExperimentalMcpWebhookSubscription as McpWebhookSubscription,
+} from "../src/events/types";
 
 vi.mock("node:https", async (importOriginal) => ({
   ...(await importOriginal<typeof import("node:https")>()),

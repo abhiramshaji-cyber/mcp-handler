@@ -5,9 +5,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   sendWebhookControl,
   verifyWebhookEndpoint,
-  type McpEventContext,
   type WebhookNetworkOptions,
-} from "../src/events/advanced";
+} from "../src/events/webhook";
+import type { ExperimentalMcpEventContext as McpEventContext } from "../src/events/types";
 
 const target = {
   id: "sub_test",
