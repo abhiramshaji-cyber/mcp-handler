@@ -219,6 +219,35 @@ Callbacks must be HTTPS to a public address checked at connection time;
 redirects are never followed. See [Network options](#network-options) to
 allow private receivers.
 
+## Checking access with Vercel Connect
+
+`authorize` runs before every delivery in the queue worker, where no user
+access token is available. When the permission lives in a provider your users
+connect through [Vercel Connect](https://vercel.com/docs/connect),
+`connectAuthorize` gets the subscriber's token for each check:
+
+```typescript
+import { connectAuthorize, defineEvent } from "mcp-handler/events";
+
+export const issueCreated = defineEvent({
+  // ...
+  authorize: connectAuthorize("linear/acme", (token, { projectId }) =>
+    canReadProject(token, projectId),
+  ),
+});
+```
+
+It requests a token for `{ type: "user", id: principal }`; pass `subject` to
+map principals to Connect users and `scopes` to narrow the token. When the
+grant is gone (`UserAuthorizationRequiredError`, `NoValidTokenError` or
+`ConnectorInstallationRequiredError`), the check denies and the subscription
+ends. Any other Connect error retries the delivery. Install `@vercel/connect`,
+an optional peer dependency.
+
+Connect bills per token request. Its SDK caches tokens until shortly before
+they expire, which keeps that down, but a revoked grant can keep passing until
+the cached token expires.
+
 ## Configuration
 
 | Option                       | Default             | Meaning                                                                |

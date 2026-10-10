@@ -70,12 +70,15 @@ function setup(
 ) {
   const queue = memoryQueue({ mode: "manual" });
   const allowed = new Set(["alice:ABC", "alice:XYZ", "bob:ABC"]);
+  const policy = { outage: false };
   const issueCreated = defineEvent({
     name: "issue.created",
     input: input as z.ZodObject<{ project: z.ZodString }>,
     payload: z.object({ id: z.string(), project: z.string() }),
-    authorize: async ({ project }, { principal }) =>
-      allowed.has(`${principal}:${project}`),
+    authorize: async ({ project }, { principal }) => {
+      if (policy.outage) throw new Error("permissions service unavailable");
+      return allowed.has(`${principal}:${project}`);
+    },
     partitionBy: {
       arguments: ({ project }) => project,
       payload: ({ project }) => project,
@@ -183,6 +186,7 @@ function setup(
     queue,
     store,
     allowed,
+    policy,
     rpc,
     subscribe,
     unsubscribe,
@@ -332,6 +336,23 @@ describe.each(stores)("createMcpEvents (%s store)", (_, factory) => {
     await app.emit("evt_2", "ABC");
     await app.queue.drain();
     expect(receiver.events()).toEqual([]);
+  });
+
+  it("retries instead of revoking when the authorization policy throws", async () => {
+    const receiver = fakeReceiver();
+    const app = setup();
+    await app.subscribe("alice", "ABC", { sep: true });
+    app.policy.outage = true;
+    await app.emit("evt_1", "ABC");
+    await app.queue.drain();
+    expect(receiver.events()).toEqual([]);
+    expect(receiver.controls()).toEqual([]);
+    expect(app.queue.pending()).toMatchObject([{ attempt: 2 }]);
+    // The subscription survives the outage and delivers once it recovers.
+    app.policy.outage = false;
+    for (const job of app.queue.pending())
+      await app.events.process(job.job, { attempt: job.attempt });
+    expect(receiver.events()).toHaveLength(1);
   });
 
   it("terminates subscriptions whose stored arguments no longer fit the schema", async () => {
