@@ -14,6 +14,7 @@ export type { McpEventsStore } from "./engine/store";
 export { fromNodeRedis, fromUpstash, redisStore } from "./engine/redis";
 export type { RedisLike } from "./engine/redis";
 export { memoryQueue } from "./engine/queue";
+export { vercelQueue, vercelQueueConsumer } from "./engine/vercel-queue";
 export type {
   McpEventsJob,
   McpEventsJobProcessor,

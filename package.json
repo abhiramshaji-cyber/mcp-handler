@@ -92,6 +92,8 @@
     "@modelcontextprotocol/client": "^2.0.0",
     "@modelcontextprotocol/server": "^2.0.0",
     "@types/node": "^22.15.8",
+    "@upstash/redis": "^1.39.0",
+    "@vercel/queue": "~0.8.0",
     "redis": "^6.3.0",
     "tsup": "^8.0.0",
     "typescript": "^5.0.0",
