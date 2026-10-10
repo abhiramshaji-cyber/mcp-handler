@@ -1,9 +1,12 @@
 import dns from "node:dns";
 import { syncBuiltinESMExports } from "node:module";
+import { createServer, type AddressInfo } from "node:net";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  experimental_sendMcpWebhookControl,
   experimental_verifyMcpWebhookEndpoint,
   type ExperimentalMcpEventContext,
+  type ExperimentalMcpWebhookNetworkOptions,
 } from "../src/index";
 
 const target = {
@@ -18,6 +21,13 @@ const context: ExperimentalMcpEventContext = {
   authInfo: { token: "test", clientId: "test", scopes: [] },
   signal: new AbortController().signal,
 };
+
+const gap = (url: string, network?: ExperimentalMcpWebhookNetworkOptions) =>
+  experimental_sendMcpWebhookControl({
+    subscription: { ...target, url },
+    control: { type: "gap", cursor: "c1" },
+    network,
+  });
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -42,6 +52,47 @@ describe("webhook address filtering with the real HTTPS transport", () => {
     ).resolves.toEqual({ verified: false, reason: "connection_refused" });
   });
 
+  it.each(["127.0.0.1", "[fd00::1]"])(
+    "reports %s as a non-retryable blocked destination",
+    async (host) => {
+      await expect(gap(`https://${host}/hooks`)).resolves.toEqual({
+        ok: false,
+        reason: "blocked_destination",
+        retryable: false,
+      });
+    },
+  );
+
+  it("connects to explicitly allowed private addresses only", async () => {
+    // A plain TCP listener: the TLS handshake fails after the address check.
+    let connections = 0;
+    const server = createServer((socket) => {
+      connections++;
+      socket.destroy();
+    });
+    await new Promise<void>((resolve) =>
+      server.listen(0, "127.0.0.1", resolve),
+    );
+    try {
+      const { port } = server.address() as AddressInfo;
+      const url = `https://127.0.0.1:${port}/hooks`;
+      await expect(gap(url)).resolves.toMatchObject({
+        reason: "blocked_destination",
+      });
+      expect(connections).toBe(0);
+      await expect(
+        gap(url, { allowIPAddressList: ["10.0.0.0/8"] }),
+      ).resolves.toMatchObject({ reason: "blocked_destination" });
+      expect(connections).toBe(0);
+      await expect(
+        gap(url, { allowIPAddressList: ["127.0.0.0/8"] }),
+      ).resolves.toMatchObject({ ok: false, retryable: true });
+      expect(connections).toBe(1);
+    } finally {
+      await new Promise((resolve) => server.close(resolve));
+    }
+  });
+
   it("validates DNS results again for each attempt", async () => {
     // Stub resolution, not the HTTP transport or the filtering agent. Both
     // answers must be rejected before opening a connection.
@@ -64,9 +115,11 @@ describe("webhook address filtering with the real HTTPS transport", () => {
     await expect(
       experimental_verifyMcpWebhookEndpoint(subscription, context),
     ).resolves.toEqual({ verified: false, reason: "connection_refused" });
-    await expect(
-      experimental_verifyMcpWebhookEndpoint(subscription, context),
-    ).resolves.toEqual({ verified: false, reason: "connection_refused" });
+    await expect(gap(subscription.url)).resolves.toEqual({
+      ok: false,
+      reason: "blocked_destination",
+      retryable: false,
+    });
     expect(lookup).toHaveBeenCalledTimes(2);
   });
 });

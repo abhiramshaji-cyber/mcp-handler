@@ -6,10 +6,16 @@ export { experimental_registerMcpEvents } from "./events/register";
 export {
   experimental_verifyMcpWebhookEndpoint,
   experimental_deliverMcpEvent,
+  experimental_sendMcpWebhookControl,
 } from "./events/webhook";
 export type {
   ExperimentalMcpEventDeliveryOptions,
+  ExperimentalMcpWebhookControl,
+  ExperimentalMcpWebhookControlOptions,
+  ExperimentalMcpWebhookNetworkOptions,
+  ExperimentalMcpWebhookRejection,
   ExperimentalMcpWebhookResult,
+  ExperimentalMcpWebhookTransportFailure,
 } from "./events/webhook";
 export {
   experimental_validateMcpEventDelivery,

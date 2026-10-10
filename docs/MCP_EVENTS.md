@@ -165,6 +165,7 @@ The application backend is responsible for:
   `webhook-id`, `webhook-timestamp`, `webhook-signature` and
   `X-MCP-Subscription-Id`. Re-sign each retry with a fresh timestamp; support
   in-flight secret rotation and signed verification/gap/termination controls.
+  The optional webhook helpers implement this signing.
 - Event sources, filter matching, payload-schema validation and ongoing
   authorization. Admission authorization alone does not authorize delivery after
   access is revoked. Enforce quotas, expiry and cancellation in the worker.
@@ -234,22 +235,51 @@ without replay should continue returning `cursor: null`.
 
 ## Optional webhook helpers
 
-Two experimental Node.js helpers provide the signed challenge exchange and a
-single event delivery attempt. They use `standardwebhooks` for signatures and
-`request-filtering-agent` for address checks at connection time. Both require
-HTTPS, reject credentials and URL fragments, reject private/special-use
-addresses, preserve TLS certificate verification, and never follow redirects.
-These restrictions also apply in development. There is no custom `fetch` or
-agent override; applications with a different egress policy can keep their own
-`ExperimentalMcpWebhookDelivery` implementation.
+Three experimental Node.js helpers cover the signed challenge exchange, a single
+event delivery attempt, and `gap`/`terminated` notices. They use
+`standardwebhooks` for signatures and `request-filtering-agent` for address
+checks at connection time. All of them require HTTPS, reject credentials and URL
+fragments, reject private/special-use addresses unless explicitly allowed,
+preserve TLS certificate verification, and never follow redirects. These
+restrictions also apply in development. There is no custom `fetch` or agent
+override; applications with a different egress policy (for example, a mandatory
+outbound proxy) can keep their own `ExperimentalMcpWebhookDelivery`
+implementation.
+
+### Network options
+
+Every helper accepts the same optional settings: the third argument of
+`experimental_verifyMcpWebhookEndpoint`, or `network` for the other two.
+
+```typescript
+import type { ExperimentalMcpWebhookNetworkOptions } from "mcp-handler";
+
+export const webhookNetwork: ExperimentalMcpWebhookNetworkOptions = {
+  // Private receivers you operate. Every other non-public address stays blocked.
+  allowIPAddressList: ["10.20.0.0/16"],
+  timeoutMs: 5_000,
+};
+```
+
+| Option               | Meaning                                                                                                                                   |
+| -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `allowIPAddressList` | IP addresses or CIDRs that may be reached even though they are private or special-use. Hostnames are rejected. Default `[]`.              |
+| `timeoutMs`          | Total deadline for each request, including DNS, TLS and (for challenges) the response body. Default `10000`; the draft calls ~5 s common. |
+
+Use one settings object for all helpers, and never derive the allowlist from
+client input. To test end to end against a local receiver, allow `127.0.0.1` in
+test configuration only and serve HTTPS with a certificate Node.js trusts, for
+example through `NODE_EXTRA_CA_CERTS`.
 
 ### Verify callback consent
 
-`experimental_verifyMcpWebhookEndpoint(target, context)` has the existing
-`verifyEndpoint` signature. It sends one signed verification challenge and
+`experimental_verifyMcpWebhookEndpoint(target, context, network?)` can be used
+directly as `verifyEndpoint`. It sends one signed verification challenge and
 returns `{ verified: true }` only when a complete `2xx` JSON response echoes the
 nonce. Mismatches and transport failures return `{ verified: false, reason }`
-with the existing diagnostic categories. It never returns endpoint content.
+with the draft's diagnostic categories; blocked destinations are reported as
+`connection_refused`. It never returns endpoint content. Invalid targets or
+network options throw a `TypeError`.
 
 Wrap it in your application's consent cache and admission controls:
 
@@ -258,7 +288,11 @@ import {
   experimental_verifyMcpWebhookEndpoint,
   type ExperimentalMcpWebhookDelivery,
 } from "mcp-handler";
-import { consentStore, verificationLimiter } from "./events-backend";
+import {
+  consentStore,
+  verificationLimiter,
+  webhookNetwork,
+} from "./events-backend";
 
 export const webhookDelivery: ExperimentalMcpWebhookDelivery = {
   async verifyEndpoint(target, context) {
@@ -268,7 +302,11 @@ export const webhookDelivery: ExperimentalMcpWebhookDelivery = {
 
     // Bound attempts per destination host, including failed challenges.
     await verificationLimiter.check(new URL(target.url).hostname);
-    const result = await experimental_verifyMcpWebhookEndpoint(target, context);
+    const result = await experimental_verifyMcpWebhookEndpoint(
+      target,
+      context,
+      webhookNetwork
+    );
     if (result.verified) await consentStore.markVerified(key);
     return result;
   },
@@ -290,12 +328,19 @@ first, then signs and sends the event. Use it from a durable worker after loadin
 current active state and matching the source event to the subscription filters:
 
 ```typescript
-import { experimental_deliverMcpEvent } from "mcp-handler";
-import { issueCreated, subscriptionStore } from "./events-backend";
+import {
+  experimental_deliverMcpEvent,
+  experimental_sendMcpWebhookControl,
+} from "mcp-handler";
+import {
+  issueCreated,
+  subscriptionStore,
+  webhookNetwork,
+} from "./events-backend";
 
 async function attemptDelivery(job) {
   const subscription = await subscriptionStore.get(job.subscriptionId);
-  if (!subscription) return;
+  if (!subscription) return { done: true };
 
   // The worker owns filter matching and coordination with cancellation.
   const result = await experimental_deliverMcpEvent({
@@ -305,52 +350,116 @@ async function attemptDelivery(job) {
     eventId: job.eventId,
     timestamp: new Date(job.occurredAt),
     cursor: job.safeWatermark,
-    previousSecrets: await subscriptionStore.getPreviousSecrets(subscription.id),
+    previousSecrets: await subscriptionStore.getPreviousSecrets(
+      subscription.id
+    ),
+    network: webhookNetwork,
     signal: job.signal,
   });
+  if (result.ok) return { done: true };
+
+  if (result.reason === "forbidden") {
+    // Access was revoked: notify the receiver, then remove the subscription.
+    await experimental_sendMcpWebhookControl({
+      subscription,
+      control: {
+        type: "terminated",
+        error: { code: -32012, message: "Forbidden" },
+      },
+      network: webhookNetwork,
+    });
+    await subscriptionStore.terminate(subscription.id);
+  }
 
   // Return to the durable queue's bounded retry/acknowledgement policy.
-  return result;
+  return result.retryable
+    ? { retry: true, delayMs: result.retryAfterMs }
+    : { done: true, abandoned: result.reason };
 }
 ```
 
-| Input | Meaning |
-| --- | --- |
-| `event`, `subscription`, `payload` | Trusted definition, freshly loaded active subscription, and matching source data. The helper checks the current permission policy, both schemas, event name and expiry. |
-| `eventId` | Stable event identifier, reused across retries; also sent as `webhook-id`. |
-| `timestamp` | Required `Date` when the event occurred. Persist it with the job and preserve it across retries. |
-| `cursor` | Optional safe acknowledged/abandoned watermark, default `null`. The helper never copies the subscription's requested replay cursor into the delivery. |
-| `previousSecrets` | Up to two additional trusted secrets for a short rotation grace period. Each attempt signs with the subscription's current secret plus these keys. Load current rotation state on each retry. |
-| `signal` | Optional worker cancellation signal. Cancellation rejects with the caller's abort reason and destroys the request. |
+| Input                              | Meaning                                                                                                                                                                                       |
+| ---------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `event`, `subscription`, `payload` | Trusted definition, freshly loaded active subscription, and matching source data. The helper checks the current permission policy, both schemas, event name and expiry.                       |
+| `eventId`                          | Stable event identifier, reused across retries; also sent as `webhook-id`.                                                                                                                    |
+| `timestamp`                        | Required `Date` when the event occurred. Persist it with the job and preserve it across retries.                                                                                              |
+| `cursor`                           | Optional safe acknowledged/abandoned watermark, default `null`. The subscription's requested replay cursor is not an input.                                                                   |
+| `previousSecrets`                  | Up to two additional trusted secrets for a short rotation grace period. Each attempt signs with the subscription's current secret plus these keys. Load current rotation state on each retry. |
+| `network`                          | Optional [network options](#network-options).                                                                                                                                                 |
+| `signal`                           | Optional worker cancellation signal. Cancellation rejects with the caller's abort reason and destroys the request.                                                                            |
 
 The request body is `{ eventId, name, timestamp, data, cursor }`. Every attempt
 gets fresh Standard Webhooks signing headers and `X-MCP-Subscription-Id`. The
 helper snapshots the selected subscription fields and plain JSON payload before
-async validation; unrelated database metadata is ignored. Unpadded valid
-`whsec_` secrets are accepted, as in subscription registration.
+async validation; unrelated database metadata is ignored. Payload key order is
+preserved, and object properties set to `undefined` are omitted, as with
+`JSON.stringify`. Unpadded valid `whsec_` secrets are accepted, as in
+subscription registration.
 
-Success returns `{ ok: true }`. Transport failures return
-`{ ok: false, reason, retryable, status? }`, with no endpoint response content.
-`410` and `413` are non-retryable for this event, without deleting or terminating
-the subscription. Redirects and oversized responses are also non-retryable.
-Other HTTP failures and network failures are retryable under the worker's
-bounded retry policy. `reason` is one of `connection_refused`, `timeout`,
-`tls_error`, `http_4xx`, `http_5xx`, `redirect`, or `response_too_large`.
+A `2xx` status acknowledges the event. The helper resolves as soon as response
+headers arrive and discards the body, so a large, slow or truncated response body
+cannot turn an accepted event into a failure or a duplicate.
 
-Schema/authorization/expiry failures throw `ExperimentalMcpEventDeliveryError`;
-policy-service exceptions also propagate. Invalid URL, key or identifier inputs,
-invalid timestamps/cursors, and oversized outgoing bodies throw before dispatch.
-Do not treat a policy-service outage as revoked access. The helper does not
-schedule retries, update acknowledgement state, compute watermarks, cache
-permissions, or delete subscriptions.
+Every known outcome resolves, so a worker can handle the result with one
+`switch`. A failure is `{ ok: false, reason, retryable }`, with no endpoint
+response content:
 
-Both network operations use a ten-second total request deadline and a 64 KiB
-response limit; outgoing event envelopes are limited to 256 KiB. DNS address
-checks apply on each attempt, with no pooled connections. Timeouts, aborts,
-truncated responses and oversized responses tear down the request/response.
-These helpers do not send `gap` or `terminated` controls; lifecycle adapters
-remain responsible for those. The validation-only helper below remains useful
-when your backend already provides signing and delivery.
+| `reason`                                     | `retryable`             | Meaning                                                                                                                                       |
+| -------------------------------------------- | ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| `connection_refused`, `timeout`, `tls_error` | yes                     | No response, including DNS failures and connections dropped before response headers.                                                          |
+| `http_4xx`, `http_5xx`                       | yes, except `410`/`413` | Includes `status`, and `retryAfterMs` when a retryable response has a valid `Retry-After`. `410`/`413` stop this event, not the subscription. |
+| `redirect`                                   | no                      | A `3xx` response. Redirects are never followed.                                                                                               |
+| `blocked_destination`                        | no                      | The URL resolved to an address that is not publicly routable and not in `allowIPAddressList`.                                                 |
+| `expired`                                    | no                      | The grant expired, including during asynchronous checks or right before sending.                                                              |
+| `forbidden`                                  | no                      | The policy no longer allows delivery. The draft expects a `terminated` notice.                                                                |
+| `invalid_subscription`                       | no                      | Unusable stored record: identity shape, deadline, callback URL, subscription ID or signing key.                                               |
+| `invalid_arguments`, `event_mismatch`        | no                      | Stored filters no longer match the input schema unchanged, or the definition belongs to another event.                                        |
+| `invalid_payload`, `payload_too_large`       | no                      | The data is not plain JSON matching the payload schema unchanged, or the envelope exceeds 256 KiB. Size is checked before any policy call.    |
+
+Nothing is sent for the rejections from `expired` down. The helper throws only
+in three cases: a `TypeError` for malformed arguments (an `eventId` that is not
+a header-safe string, an invalid timestamp or cursor, more than two previous
+secrets, invalid network options); exceptions from the event's schemas or
+`authorize` policy, which should be retried because a policy-service outage is
+not revoked access; and caller cancellation. The helper does not schedule
+retries, update acknowledgement state, compute watermarks, cache permissions, or
+delete subscriptions.
+
+### Send gap and termination notices
+
+`experimental_sendMcpWebhookControl({ subscription, control, previousSecrets?,
+network?, signal? })` signs and sends one of the draft's non-event bodies, with
+the same headers and transport rules as events:
+
+```typescript
+await experimental_sendMcpWebhookControl({
+  subscription,
+  control: { type: "gap", cursor: freshCursor },
+  network: webhookNetwork,
+});
+```
+
+| `control`                                                 | Body sent                                                |
+| --------------------------------------------------------- | -------------------------------------------------------- |
+| `{ type: "gap", cursor }`                                 | `{"type":"gap","cursor":"…"}`                            |
+| `{ type: "terminated", error: { code, message, data? } }` | `{"type":"terminated","error":{"code":…,"message":"…"}}` |
+
+Only these fields are sent, and `data` must be plain JSON. No authorization or
+expiry checks run, because `terminated` is often sent precisely because access
+was revoked. The `webhook-id` is `msg_<type>_<digest>`, derived from the
+subscription ID and body, so retries of the same notice reuse it and receivers
+can deduplicate them. Results use the same shape as event delivery; the only
+possible rejections are `invalid_subscription` and `payload_too_large`.
+Malformed notices throw a `TypeError`. The worker decides when a gap occurred,
+retries notices, and removes terminated subscriptions through its storage
+adapter.
+
+All helpers use the configured total request deadline (ten seconds by default).
+Challenge responses are limited to 64 KiB and outgoing bodies to 256 KiB. DNS
+address checks apply on each attempt, with no pooled connections. Timeouts,
+aborts, truncated responses and oversized challenge responses tear down the
+request. The validation-only helper below remains useful when your backend
+already provides signing and delivery.
 
 ## Validating delivery in a worker
 
@@ -416,7 +525,8 @@ one of these `code` values:
 Do not send on any failure. Policy/schema exceptions and abort reasons propagate
 unchanged: a permissions-service outage is not proof of revocation. Let the
 durable worker decide retries and termination; this helper does not delete
-subscriptions or send signed termination controls.
+subscriptions or send signed termination controls (see
+[`experimental_sendMcpWebhookControl`](#send-gap-and-termination-notices)).
 
 This validates a candidate against the supplied state, not against the database.
 It cannot detect a cancelled or suspended subscription in an old snapshot.
