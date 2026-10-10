@@ -42,20 +42,7 @@ export function experimental_registerMcpEvents(
   options: ExperimentalMcpEventsOptions,
 ): void {
   if (registered.has(server)) throw new Error("MCP Events already registered");
-  const minMs = options.ttl?.minMs ?? 60_000;
-  const defaultMs = options.ttl?.defaultMs ?? 3_600_000;
-  const maxMs = options.ttl?.maxMs ?? 86_400_000;
-  if (
-    ![minMs, defaultMs, maxMs].every(
-      (value) => Number.isSafeInteger(value) && value > 0,
-    ) ||
-    minMs > defaultMs ||
-    defaultMs > maxMs ||
-    maxMs > 8.64e15 - Date.now()
-  )
-    throw new Error(
-      "MCP Events TTLs must satisfy 0 < minMs <= defaultMs <= maxMs",
-    );
+  const { minMs, defaultMs, maxMs } = resolveTtl(options.ttl);
   registered.add(server);
   const chatgptCompat = options.chatgptCompat ?? true;
 
@@ -251,6 +238,25 @@ export function experimental_registerMcpEvents(
         return {};
       }),
   );
+}
+
+/** Apply TTL defaults and reject invalid bounds. */
+export function resolveTtl(ttl: ExperimentalMcpEventsOptions["ttl"]) {
+  const minMs = ttl?.minMs ?? 60_000;
+  const defaultMs = ttl?.defaultMs ?? 3_600_000;
+  const maxMs = ttl?.maxMs ?? 86_400_000;
+  if (
+    ![minMs, defaultMs, maxMs].every(
+      (value) => Number.isSafeInteger(value) && value > 0,
+    ) ||
+    minMs > defaultMs ||
+    defaultMs > maxMs ||
+    maxMs > 8.64e15 - Date.now()
+  )
+    throw new Error(
+      "MCP Events TTLs must satisfy 0 < minMs <= defaultMs <= maxMs",
+    );
+  return { minMs, defaultMs, maxMs };
 }
 
 async function subscriptionKey(

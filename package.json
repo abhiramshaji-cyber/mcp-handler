@@ -27,6 +27,14 @@
       "import": "./dist/index.mjs",
       "require": "./dist/index.js"
     },
+    "./events": {
+      "types": {
+        "import": "./dist/events/index.d.mts",
+        "require": "./dist/events/index.d.ts"
+      },
+      "import": "./dist/events/index.mjs",
+      "require": "./dist/events/index.js"
+    },
     "./events/advanced": {
       "types": {
         "import": "./dist/events/advanced.d.mts",
@@ -38,6 +46,9 @@
   },
   "typesVersions": {
     "*": {
+      "events": [
+        "./dist/events/index.d.ts"
+      ],
       "events/advanced": [
         "./dist/events/advanced.d.ts"
       ]
