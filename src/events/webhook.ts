@@ -24,7 +24,7 @@ const MAX_RESPONSE_BYTES = 64 * 1024;
 const MAX_PREVIOUS_SECRETS = 2;
 
 /** @experimental Egress settings shared by the webhook helpers. */
-export interface ExperimentalMcpWebhookNetworkOptions {
+export interface WebhookNetworkOptions {
   /**
    * Private or special-use IPs/CIDRs to permit, such as a private-cloud
    * receiver or a local test endpoint. Every other non-public address stays
@@ -36,31 +36,31 @@ export interface ExperimentalMcpWebhookNetworkOptions {
 }
 
 /** @experimental Why a request failed in transit; never endpoint content. */
-export type ExperimentalMcpWebhookTransportFailure =
+export type WebhookTransportFailure =
   | Exclude<ExperimentalMcpWebhookFailure, "challenge_failed">
   | "redirect"
   | "blocked_destination";
 
 /** @experimental Why nothing was sent; retrying the same input cannot help. */
-export type ExperimentalMcpWebhookRejection =
+export type WebhookRejection =
   | ExperimentalMcpEventDeliveryErrorCode
   | "payload_too_large";
 
 /** @experimental The outcome of one attempt; the caller owns bounded retries. */
-export type ExperimentalMcpWebhookResult =
+export type WebhookResult =
   | { ok: true }
   | {
       ok: false;
-      reason: ExperimentalMcpWebhookTransportFailure;
+      reason: WebhookTransportFailure;
       retryable: boolean;
       status?: number;
       /** From the endpoint's Retry-After header, on retryable HTTP failures. */
       retryAfterMs?: number;
     }
-  | { ok: false; reason: ExperimentalMcpWebhookRejection; retryable: false };
+  | { ok: false; reason: WebhookRejection; retryable: false };
 
 /** @experimental Load current, active subscription state before each attempt. */
-export interface ExperimentalMcpEventDeliveryOptions {
+export interface WebhookEventDeliveryOptions {
   event: ExperimentalMcpEventDefinition;
   subscription: Pick<
     ExperimentalMcpWebhookSubscription,
@@ -81,12 +81,12 @@ export interface ExperimentalMcpEventDeliveryOptions {
   cursor?: string | null;
   /** Up to two keys still trusted during a secret rotation grace period. */
   previousSecrets?: readonly string[];
-  network?: ExperimentalMcpWebhookNetworkOptions;
+  network?: WebhookNetworkOptions;
   signal?: AbortSignal;
 }
 
 /** @experimental A non-event notice defined by the draft. */
-export type ExperimentalMcpWebhookControl =
+export type WebhookControl =
   | { type: "gap"; cursor: string }
   | {
       type: "terminated";
@@ -94,15 +94,15 @@ export type ExperimentalMcpWebhookControl =
     };
 
 /** @experimental Load current subscription state before each attempt. */
-export interface ExperimentalMcpWebhookControlOptions {
+export interface WebhookControlOptions {
   subscription: Pick<
     ExperimentalMcpWebhookSubscription,
     "id" | "url" | "secret"
   >;
-  control: ExperimentalMcpWebhookControl;
+  control: WebhookControl;
   /** Up to two keys still trusted during a secret rotation grace period. */
   previousSecrets?: readonly string[];
-  network?: ExperimentalMcpWebhookNetworkOptions;
+  network?: WebhookNetworkOptions;
   signal?: AbortSignal;
 }
 
@@ -114,10 +114,10 @@ export interface ExperimentalMcpWebhookControlOptions {
  *
  * @experimental HTTPS/public destinations only unless network allows others.
  */
-export async function experimental_verifyMcpWebhookEndpoint(
+export async function verifyWebhookEndpoint(
   target: Pick<ExperimentalMcpWebhookSubscription, "id" | "url" | "secret">,
   context: Pick<ExperimentalMcpEventContext, "signal">,
-  network?: ExperimentalMcpWebhookNetworkOptions,
+  network?: WebhookNetworkOptions,
 ): ReturnType<ExperimentalMcpWebhookDelivery["verifyEndpoint"]> {
   context.signal.throwIfAborted();
   const settings = networkSettings(network);
@@ -165,7 +165,7 @@ export async function experimental_verifyMcpWebhookEndpoint(
  *
  * @experimental HTTPS/public destinations only unless network allows others.
  */
-export async function experimental_deliverMcpEvent({
+export async function deliverWebhookEvent({
   event,
   subscription,
   payload,
@@ -175,7 +175,7 @@ export async function experimental_deliverMcpEvent({
   previousSecrets = [],
   network,
   signal,
-}: ExperimentalMcpEventDeliveryOptions): Promise<ExperimentalMcpWebhookResult> {
+}: WebhookEventDeliveryOptions): Promise<WebhookResult> {
   signal?.throwIfAborted();
   if (!isWebhookId(eventId)) throw new TypeError("Invalid webhook identifier");
   if (!(timestamp instanceof Date) || !Number.isFinite(timestamp.getTime()))
@@ -250,17 +250,17 @@ export async function experimental_deliverMcpEvent({
  * Sign and POST one `gap` or `terminated` notice. No authorization or expiry
  * checks run: `terminated` is often sent because access was revoked. Retries
  * of the same notice reuse the same `webhook-id`. Results and errors follow
- * experimental_deliverMcpEvent.
+ * deliverWebhookEvent.
  *
  * @experimental HTTPS/public destinations only unless network allows others.
  */
-export async function experimental_sendMcpWebhookControl({
+export async function sendWebhookControl({
   subscription,
   control,
   previousSecrets = [],
   network,
   signal,
-}: ExperimentalMcpWebhookControlOptions): Promise<ExperimentalMcpWebhookResult> {
+}: WebhookControlOptions): Promise<WebhookResult> {
   signal?.throwIfAborted();
   const { type, body } = controlBody(control);
   const settings = networkSettings(network);
@@ -296,10 +296,9 @@ type NetworkSettings = { allowIPAddressList: string[]; timeoutMs: number };
 
 type PostResult =
   // body is null when a challenge response exceeds the size limit.
-  | { ok: true; body: string | null }
-  | Exclude<ExperimentalMcpWebhookResult, { ok: true }>;
+  { ok: true; body: string | null } | Exclude<WebhookResult, { ok: true }>;
 
-function rejected(reason: ExperimentalMcpWebhookRejection) {
+function rejected(reason: WebhookRejection) {
   return { ok: false, reason, retryable: false } as const;
 }
 
@@ -322,7 +321,7 @@ function verificationFailure(
 }
 
 function networkSettings(
-  network: ExperimentalMcpWebhookNetworkOptions | undefined,
+  network: WebhookNetworkOptions | undefined,
 ): NetworkSettings {
   const timeoutMs = network?.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const allowList = network?.allowIPAddressList ?? [];
@@ -360,7 +359,7 @@ function signingKeys(
   return [secret, ...previousSecrets];
 }
 
-function controlBody(control: ExperimentalMcpWebhookControl): {
+function controlBody(control: WebhookControl): {
   type: string;
   body: string;
 } {

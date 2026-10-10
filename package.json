@@ -14,7 +14,7 @@
     ".": {
       "types": {
         "import": "./dist/index.d.mts",
-        "require": "./dist/index.d.cjs"
+        "require": "./dist/index.d.ts"
       },
       "import": "./dist/index.mjs",
       "require": "./dist/index.js"
@@ -22,10 +22,25 @@
     "./next": {
       "types": {
         "import": "./dist/index.d.mts",
-        "require": "./dist/index.d.cjs"
+        "require": "./dist/index.d.ts"
       },
       "import": "./dist/index.mjs",
       "require": "./dist/index.js"
+    },
+    "./events/advanced": {
+      "types": {
+        "import": "./dist/events/advanced.d.mts",
+        "require": "./dist/events/advanced.d.ts"
+      },
+      "import": "./dist/events/advanced.mjs",
+      "require": "./dist/events/advanced.js"
+    }
+  },
+  "typesVersions": {
+    "*": {
+      "events/advanced": [
+        "./dist/events/advanced.d.ts"
+      ]
     }
   },
   "files": [

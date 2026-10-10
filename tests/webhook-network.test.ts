@@ -3,11 +3,11 @@ import { syncBuiltinESMExports } from "node:module";
 import { createServer, type AddressInfo } from "node:net";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
-  experimental_sendMcpWebhookControl,
-  experimental_verifyMcpWebhookEndpoint,
-  type ExperimentalMcpEventContext,
-  type ExperimentalMcpWebhookNetworkOptions,
-} from "../src/index";
+  sendWebhookControl,
+  verifyWebhookEndpoint,
+  type McpEventContext,
+  type WebhookNetworkOptions,
+} from "../src/events/advanced";
 
 const target = {
   id: "sub_test",
@@ -16,14 +16,14 @@ const target = {
   arguments: {},
   secret: `whsec_${Buffer.alloc(32, 13).toString("base64")}`,
 };
-const context: ExperimentalMcpEventContext = {
+const context: McpEventContext = {
   principal: target.principal,
   authInfo: { token: "test", clientId: "test", scopes: [] },
   signal: new AbortController().signal,
 };
 
-const gap = (url: string, network?: ExperimentalMcpWebhookNetworkOptions) =>
-  experimental_sendMcpWebhookControl({
+const gap = (url: string, network?: WebhookNetworkOptions) =>
+  sendWebhookControl({
     subscription: { ...target, url },
     control: { type: "gap", cursor: "c1" },
     network,
@@ -45,7 +45,7 @@ describe("webhook address filtering with the real HTTPS transport", () => {
   ])("rejects the non-public literal %s without connecting", async (host) => {
     vi.stubEnv("NODE_ENV", "development");
     await expect(
-      experimental_verifyMcpWebhookEndpoint(
+      verifyWebhookEndpoint(
         { ...target, url: `https://${host}/hooks` },
         context,
       ),
@@ -112,9 +112,9 @@ describe("webhook address filtering with the real HTTPS transport", () => {
       });
     syncBuiltinESMExports();
     const subscription = { ...target, url: "https://receiver.example/hooks" };
-    await expect(
-      experimental_verifyMcpWebhookEndpoint(subscription, context),
-    ).resolves.toEqual({ verified: false, reason: "connection_refused" });
+    await expect(verifyWebhookEndpoint(subscription, context)).resolves.toEqual(
+      { verified: false, reason: "connection_refused" },
+    );
     await expect(gap(subscription.url)).resolves.toEqual({
       ok: false,
       reason: "blocked_destination",
