@@ -224,21 +224,37 @@ allow private receivers.
 `authorize` runs before every delivery in the queue worker, where no user
 access token is available. When the permission lives in a provider your users
 connect through [Vercel Connect](https://vercel.com/docs/connect),
-`connectAuthorize` gets the subscriber's token for each check:
+`connect` gets the subscriber's token for each check:
 
 ```typescript
-import { connectAuthorize, defineEvent } from "mcp-handler/events";
+import { connect, defineEvent } from "mcp-handler/events";
 
 export const issueCreated = defineEvent({
   // ...
-  authorize: connectAuthorize("linear/acme", (token, { projectId }) =>
+  authorize: connect("linear/acme", (token, { projectId }) =>
     canReadProject(token, projectId),
   ),
 });
 ```
 
 It requests a token for `{ type: "user", id: principal }`; pass `subject` to
-map principals to Connect users and `scopes` to narrow the token. When the
+map principals to Connect users and `scopes` to narrow the token. When users
+sign in to your MCP route with an identity provider that is also set up in
+Connect, return `experimental_idp` from `subject` so Connect resolves their
+token with Cross-App Access instead of a separate consent per connector:
+
+```typescript
+connect("linear/acme", check, {
+  subject: (sub) => ({
+    type: "user",
+    id: sub,
+    issuer: "https://acme.okta.com",
+    experimental_idp: "okta/acme",
+  }),
+});
+```
+
+When the
 grant is gone (`UserAuthorizationRequiredError`, `NoValidTokenError` or
 `ConnectorInstallationRequiredError`), the check denies and the subscription
 ends. Any other Connect error retries the delivery. Install `@vercel/connect`,

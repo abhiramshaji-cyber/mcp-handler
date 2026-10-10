@@ -2,10 +2,20 @@ import type { ExperimentalMcpEventAuthorizationContext } from "../types";
 
 /** @experimental The Vercel Connect subject whose token `authorize` uses. */
 export type ConnectAuthorizeSubject =
-  | { type: "user"; id: string; issuer?: string }
+  | {
+      type: "user";
+      id: string;
+      issuer?: string;
+      /**
+       * Resolve the user through this identity-provider connector with
+       * Cross-App Access (ID-JAG), so users who signed in with your IdP need
+       * no separate consent per connector. Experimental in @vercel/connect.
+       */
+      experimental_idp?: string;
+    }
   | { type: "app" };
 
-/** @experimental Options for `connectAuthorize`. */
+/** @experimental Options for `connect`. */
 export interface ConnectAuthorizeOptions {
   /**
    * Map the events principal to a Connect subject.
@@ -24,7 +34,7 @@ let connectModule: Promise<ConnectModule> | undefined;
 function loadConnect() {
   connectModule ??= import("@vercel/connect").catch((error) => {
     connectModule = undefined;
-    throw new Error("connectAuthorize requires the @vercel/connect package", {
+    throw new Error("connect requires the @vercel/connect package", {
       cause: error,
     });
   });
@@ -41,7 +51,7 @@ function loadConnect() {
  *
  * @experimental
  */
-export function connectAuthorize<Args>(
+export function connect<Args>(
   connector: string,
   check: (
     token: string,

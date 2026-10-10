@@ -15,7 +15,7 @@ export { redisStore } from "./engine/redis";
 export type { RedisClient } from "./engine/redis";
 export { memoryQueue } from "./engine/queue";
 export { vercelQueue, vercelQueueConsumer } from "./engine/vercel-queue";
-export { connectAuthorize } from "./engine/connect";
+export { connect } from "./engine/connect";
 export type {
   ConnectAuthorizeOptions,
   ConnectAuthorizeSubject,

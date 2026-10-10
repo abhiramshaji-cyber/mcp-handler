@@ -6,7 +6,7 @@ import {
   UserAuthorizationRequiredError,
   getToken,
 } from "@vercel/connect";
-import { connectAuthorize } from "../src/events/index";
+import { connect } from "../src/events/index";
 
 vi.mock("@vercel/connect", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@vercel/connect")>()),
@@ -22,14 +22,14 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
-describe("connectAuthorize", () => {
+describe("connect", () => {
   it("checks access with the principal's Connect token", async () => {
     vi.mocked(getToken).mockResolvedValue("tok");
     const check = vi.fn(
       async (token: string, args: { projectId: string }) =>
         token === "tok" && args.projectId === "p1",
     );
-    const authorize = connectAuthorize("linear/acme", check);
+    const authorize = connect("linear/acme", check);
     const ctx = context();
     await expect(authorize({ projectId: "p1" }, ctx)).resolves.toBe(true);
     await expect(authorize({ projectId: "p2" }, ctx)).resolves.toBe(false);
@@ -41,11 +41,12 @@ describe("connectAuthorize", () => {
 
   it("maps the subject and passes scopes", async () => {
     vi.mocked(getToken).mockResolvedValue("tok");
-    const authorize = connectAuthorize("linear/acme", () => true, {
+    const authorize = connect("linear/acme", () => true, {
       subject: (principal) => ({
         type: "user",
         id: principal.split(":")[1],
-        issuer: "https://auth.example.com",
+        issuer: "https://acme.okta.com",
+        experimental_idp: "okta/acme",
       }),
       scopes: ["read"],
     });
@@ -54,7 +55,8 @@ describe("connectAuthorize", () => {
       subject: {
         type: "user",
         id: "alice",
-        issuer: "https://auth.example.com",
+        issuer: "https://acme.okta.com",
+        experimental_idp: "okta/acme",
       },
       scopes: ["read"],
     });
@@ -62,7 +64,7 @@ describe("connectAuthorize", () => {
 
   it("only accepts an explicit true from the check", async () => {
     vi.mocked(getToken).mockResolvedValue("tok");
-    const authorize = connectAuthorize("linear/acme", () => "yes" as never);
+    const authorize = connect("linear/acme", () => "yes" as never);
     await expect(authorize({}, context())).resolves.toBe(false);
   });
 
@@ -73,7 +75,7 @@ describe("connectAuthorize", () => {
   ])("denies when the grant is gone (%s)", async (ErrorClass) => {
     vi.mocked(getToken).mockRejectedValue(new ErrorClass("no grant"));
     const check = vi.fn(() => true);
-    const authorize = connectAuthorize("linear/acme", check);
+    const authorize = connect("linear/acme", check);
     await expect(authorize({}, context())).resolves.toBe(false);
     expect(check).not.toHaveBeenCalled();
   });
@@ -82,7 +84,7 @@ describe("connectAuthorize", () => {
     "throws on other Connect failures so deliveries retry",
     async (error) => {
       vi.mocked(getToken).mockRejectedValue(error);
-      const authorize = connectAuthorize("linear/acme", () => true);
+      const authorize = connect("linear/acme", () => true);
       await expect(authorize({}, context())).rejects.toBe(error);
     },
   );
@@ -94,7 +96,7 @@ describe("connectAuthorize", () => {
       return "tok";
     });
     const check = vi.fn(() => true);
-    const authorize = connectAuthorize("linear/acme", check);
+    const authorize = connect("linear/acme", check);
     await expect(authorize({}, context(abort.signal))).rejects.toThrow(
       "cancelled",
     );
