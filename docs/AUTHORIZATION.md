@@ -139,8 +139,51 @@ The path should match `resourceMetadataPath` in your `withMcpAuth` config (defau
 1. Client makes a request with a Bearer token in the Authorization header
 2. `verifyToken` validates the token and returns auth info
 3. If auth is required and fails → 401 response
-4. If required scopes are missing → 403 response
-5. On success, auth info is available via `ctx.http?.authInfo` in tool handlers
+4. If the token has expired → 401 response, even when scopes are also missing
+5. If required scopes are missing from a valid token → 403 response
+6. On success, auth info is available via `ctx.http?.authInfo` in tool handlers
+
+## Step-up authorization
+
+`withMcpAuth` includes the configured `requiredScopes` in the `WWW-Authenticate`
+header on both `401` and `403` responses. This lets clients request the scopes
+needed for the current operation during initial authorization or a later scope
+upgrade, following the [MCP step-up authorization flow](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization#step-up-authorization-flow).
+
+For example, a wrapper configured with
+`requiredScopes: ["files:read", "files:write"]` receiving a valid token with only
+`files:read` returns the following challenge before invoking the wrapped handler:
+
+```http
+HTTP/1.1 403 Forbidden
+WWW-Authenticate: Bearer error="insufficient_scope", error_description="Insufficient scope", scope="files:read files:write", resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource"
+Content-Type: application/json
+
+{"error":"insufficient_scope","error_description":"Insufficient scope"}
+```
+
+The challenge includes **all scopes required for the operation**, including ones
+the token already grants. A supporting client combines these with its previously
+requested scopes, reauthorizes through the same OAuth server, and retries the
+original request with the new token. Clients should bound retries and handle
+denied consent. A plain `403` without a scope challenge does not identify which
+permissions to request.
+
+Your `verifyToken` implementation must return the token's actual granted scopes
+in `AuthInfo.scopes`. Your authorization server must recognize those scopes and
+support issuing a token with the additional grants. The example scope names are
+application-defined; this package does not define or issue scopes.
+
+`requiredScopes` applies to every request reaching that wrapper. For requirements
+that vary by tool or arguments, resolve the operation's policy in your HTTP layer
+and configure the wrapper before dispatching the request. Authorize the same
+operation and arguments that the MCP handler will execute. The wrapper does not
+infer permissions from tool descriptions or convert downstream API failures into
+scope upgrades. Existing resource-level permission checks still apply.
+
+Set `required: true` when authentication is mandatory: `requiredScopes` alone
+continues to allow requests for which `verifyToken` returns `undefined`. Omit
+`requiredScopes` or pass an empty array to omit the challenge's `scope` parameter.
 
 ## CIMD (Client ID Metadata Documents)
 

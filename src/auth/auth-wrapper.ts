@@ -26,6 +26,11 @@ export function withMcpAuth(
   }: {
     required?: boolean;
     resourceMetadataPath?: string;
+    /**
+     * Scopes required for requests handled by this wrapper. Advertised in
+     * 401/403 challenges so clients can request them during authorization.
+     * Set `required: true` to also reject unauthenticated requests.
+     */
     requiredScopes?: string[];
     /**
      * Explicit resource URL override. When provided, this URL is used as the
@@ -74,6 +79,14 @@ export function withMcpAuth(
         return handler(req);
       }
 
+      // An expired token needs renewal before a scope upgrade can be evaluated.
+      if (
+        authInfo.expiresAt !== undefined &&
+        authInfo.expiresAt <= Date.now() / 1000
+      ) {
+        throw new OAuthError(OAuthErrorCode.InvalidToken, "Token has expired");
+      }
+
       // Check if token has the required scopes (if any)
       if (requiredScopes?.length) {
         const hasAllScopes = requiredScopes.every((scope) =>
@@ -88,11 +101,6 @@ export function withMcpAuth(
         }
       }
 
-      // Check if the token is expired
-      if (authInfo.expiresAt && authInfo.expiresAt < Date.now() / 1000) {
-        throw new OAuthError(OAuthErrorCode.InvalidToken, "Token has expired");
-      }
-
       // Set auth info on the request object after successful verification
       req.auth = authInfo;
 
@@ -102,8 +110,8 @@ export function withMcpAuth(
         console.error("Unexpected error authenticating bearer token:", error);
       }
       // Maps invalid_token → 401, insufficient_scope → 403 (both with a
-      // WWW-Authenticate challenge advertising resource_metadata), anything
-      // unexpected → 500 server_error.
+      // WWW-Authenticate challenge advertising scopes and resource_metadata),
+      // anything unexpected → 500 server_error.
       return bearerAuthChallengeResponse(error, challengeOptions);
     }
   };
